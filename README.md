@@ -1,6 +1,6 @@
 # ASTRA
 ## Architecture Search for Time-sensitive, Real-time Applications - System-wide Multi-DNN Design
-## Expanding Neural Architecture Search toward multi-DNN search under real-time system
+### Expanding Neural Architecture Search toward multi-DNN search under real-time system
 
 
 **STEPS**
