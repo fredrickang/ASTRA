@@ -11,7 +11,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from supernet import FBNet
 from candblks import get_blocks
-from utils import weights_init, CosineDecayLR, AvgrageMeter
+from utils import weights_init, CosineDecayLR, AverageMeter
 
 import os
 import logging
@@ -26,10 +26,10 @@ class Config(object):
     init_theta = 1.0
     alpha = 0.2
     beta = 0.6
-    w_lr = 0.1
+    w_lr = 0.1 
     w_mom = 0.9
     w_wd = 1e-4
-    t_lr = 0.01
+    t_lr = 0.01 
     t_wd = 5e-4
     t_beta = (0.9, 0.999)
     init_temperature = 5.0
@@ -62,44 +62,48 @@ class Trainer:
         self,
         model: torch.nn.Module,
         train_data: DataLoader,
+        val_data: DataLoader,
         gpu_id: int,
         save_every: int,
         lr_scheduler : {},
         writer: SummaryWriter, 
-        logging: str
+        logging: str,
+        config: Config
     ) -> None:
         self.gpu_id = gpu_id
         self.model = model.apply(weights_init)
         self.model = self.model.to(gpu_id)
         self.train_data = train_data
+        self.val_data = val_data
         self.save_every = save_every
         self.model = DDP(model, device_ids=[gpu_id])
         
         self.params = self.model.module.parameters()
         self.theta = self.model.module.theta    
-        self._temp_decay = 0.965
-        self.temp = 5.0
+        self._temp_decay = config.temperature_decay
+        self.temp = config.init_temperature
         
         self.tensorboard = writer
-        self.acc_avg = AvgrageMeter('acc')
-        self.ce_avg = AvgrageMeter('ce')
-        self.lat_avg = AvgrageMeter('lat')
-        self.loss_avg = AvgrageMeter('loss')
-        self.ener_avg = AvgrageMeter('ener')
-        
+        self.acc_avg = AverageMeter('acc')
+        self.ce_avg = AverageMeter('ce')
+        self.lat_avg = AverageMeter('lat')
+        self.loss_avg = AverageMeter('loss')
+        self.ener_avg = AverageMeter('ener')
+        self.step_counter = 0
+    
         self.w_optimizer = torch.optim.SGD(
             self.params,
-            0.1,
-            momentum=0.9,
-            weight_decay=1e-4
+            config.w_lr,
+            momentum=config.w_mom,
+            weight_decay=config.w_wd
         )
         
         self.w_scheduler = CosineDecayLR(self.w_optimizer, **lr_scheduler)
         
         self.t_optimizer = torch.optim.Adam(
             self.theta,
-            lr=0.01, betas = (0.9, 0.999),
-            weight_decay=5e-4
+            lr=config.t_lr, betas = config.t_beta,
+            weight_decay=config.t_wd
         )
         
         self.logging_prefix = logging
@@ -136,12 +140,19 @@ class Trainer:
         
         loss, ce, acc, lat, ener = func(input, target)
         
-        self.loss_avg.update(loss)
-        self.ce_avg.update(ce)
-        self.acc_avg.update(acc)
-        self.lat_avg.update(lat)
-        self.ener_avg.update(ener)
+        self.loss_avg.update(loss, input.size(0))
+        self.ce_avg.update(ce, input.size(0))
+        self.acc_avg.update(acc, input.size(0))
+        self.lat_avg.update(lat, input.size(0))
+        self.ener_avg.update(ener, input.size(0))
 
+        self.tensorboard.add_scalar('Accuracy',self.acc_avg.val, self.step_counter)
+        self.tensorboard.add_scalar('Total Loss', self.loss_avg.val, self.step_counter)            
+        self.tensorboard.add_scalar('Latency',self.lat_avg.val,self.step_counter)
+        self.tensorboard.add_scalar('Energy',self.ener_avg.val,self.step_counter)
+
+        self.step_counter += 1
+        
         if step > 1 and (step % log_freq == 0) and self.gpu_id == 0:
             self.toc = time.time()
             
@@ -151,17 +162,10 @@ class Trainer:
               % (epoch, step, speed, self.w_scheduler.optimizer.param_groups[0]['lr'], self.loss_avg, 
                  self.acc_avg, self.ce_avg, self.lat_avg,self.ener_avg))
             
-            self.tensorboard.add_scalar('Total Loss', self.loss_avg.getValue(), (epoch+1)*step)
-            self.tensorboard.add_scalar('Accuracy',self.acc_avg.getValue(),(epoch+1)*step)
-            self.tensorboard.add_scalar('Latency',self.lat_avg.getValue(),(epoch+1)*step)
-            self.tensorboard.add_scalar('Energy',self.ener_avg.getValue(),(epoch+1)*step)
-            
-            map(lambda avg: avg.reset(), [self.loss_avg, 
-                 self.acc_avg, self.ce_avg, self.lat_avg,self.ener_avg])
             self.tic = time.time()
         
-    def search(self, train_w_ds, 
-               train_t_ds,
+    def search(self, train_ds,
+               val_ds,
                total_epoch,
                log_freq,
                warmup):
@@ -169,7 +173,7 @@ class Trainer:
         # Warmup
         self.tic = time.time()
         for epoch in range(warmup):
-            for st, (input, target) in enumerate(train_w_ds):
+            for st, (input, target) in enumerate(train_ds):
                 self.step(input, target, epoch, st, log_freq,
                           lambda x, y: self.train_w(x, y))        
                 self.w_scheduler.step()
@@ -177,24 +181,25 @@ class Trainer:
 
         self.tic = time.time()
         for epoch in range(total_epoch):
-            for st, (input, target) in enumerate(train_t_ds):
+            for st, (input, target) in enumerate(train_ds):
                 self.step(input, target, epoch + warmup, st, log_freq,
                           lambda x, y: self.train_t(x, y))
             if self.gpu_id == 0:
                 self.save_theta(save_path='./theta_result/{}'.format(self.logging_prefix), 
-                            file_name='theta_epoch_%d.txt'.format(epoch + warmup), epoch=epoch)
+                            file_name='theta_epoch_{}.txt'.format(epoch + warmup), epoch=epoch)
             self.decay_temperature()
             
-            for st, (input, target) in enumerate(train_w_ds):
+            for st, (input, target) in enumerate(train_ds):
                 self.step(input, target, epoch + warmup, st, log_freq,
                           lambda x, y: self.train_w(x, y))
                 self.w_scheduler.step()
-    
+                        
     def save_theta(self, save_path='./theta_result', file_name = 'theta.txt',epoch=0):
         res = []
         try:
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
+                print("{} Created".format(save_path))
         except:
             print("Error: Failed to create the theta_dir")
     
@@ -221,8 +226,12 @@ def load_train_objs(config:Config):
         transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
         ])
     
-    train_set = torchvision.datasets.CIFAR10(root='./data', train=True, 
+    
+    dataset = torchvision.datasets.CIFAR10(root='./data', train=True, 
                 download=True, transform=train_transform)
+
+    split = int(np.floor(1*len(dataset)))
+    train_set, val_set = torch.utils.data.random_split(dataset, [split, len(dataset) - split])
 
     blocks = get_blocks(cifar10=True)
     
@@ -235,7 +244,7 @@ def load_train_objs(config:Config):
               delta=0,
               speed_f="speed.txt",
 	      energy_f="energy.txt")
-    return train_set, model
+    return train_set, val_set, model
 
 def prepare_dataloader(dataset: Dataset, batch_size: int):
     return DataLoader(
@@ -248,11 +257,12 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
 
 def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int, config: Config, exp_name: str):
     ddp_setup(rank, world_size)
-    dataset, model = load_train_objs(config)
-    train_data = prepare_dataloader(dataset, batch_size)
+    train_set, val_set, model = load_train_objs(config)
+    train_data = prepare_dataloader(train_set, batch_size)
+    val_data = prepare_dataloader(val_set, batch_size)
     writer = SummaryWriter("./runs/{}".format(exp_name))
-    trainer = Trainer(model, train_data, rank, save_every, config.lr_scheduler_params, writer, exp_name)
-    trainer.search(train_data, train_data,
+    trainer = Trainer(model, train_data, val_data, rank, save_every, config.lr_scheduler_params, writer, exp_name, config)
+    trainer.search(train_data, val_data,
                    total_epochs, save_every, 2)
     destroy_process_group()
 
@@ -267,12 +277,15 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=1024, type=int, help='Input batch size on each device (default: 1024)')
     parser.add_argument('--save', default="EXP", help="Experiment name")
     parser.add_argument('--gpus', default=1, type=int, help="Number of GPUs")
+    parser.add_argument('--lr_mul', default=1, type=float, help="Learning rate multiplier")
     
     args = parser.parse_args()
     args.save = 'search-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
     
 
     config = Config()
+    config.w_lr = config.w_lr*args.lr_mul
+    config.t_lr = config.t_lr*args.lr_mul
 
     world_size = args.gpus
     mp.spawn(main, args=(world_size, args.save_every, args.total_epochs, args.batch_size, config, args.save), nprocs=world_size)

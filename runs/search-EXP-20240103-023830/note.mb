@@ -1,0 +1,2 @@
+config
+Learning rate : %(world_size: 4) to single GPU
