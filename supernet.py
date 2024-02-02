@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-
-
 class MixedOp(nn.Module):
   """Mixed operation.
   Weighted sum of blocks.
@@ -33,6 +31,9 @@ class FBNet(nn.Module):
                beta=0,
                gamma=0,
                delta=0,
+               sf_type=0,
+               lat_const=-1,
+               loss_type=0,
                dim_feature=1984):
     super(FBNet, self).__init__()
     init_func = lambda x: nn.init.constant_(x, init_theta)
@@ -46,7 +47,11 @@ class FBNet(nn.Module):
     self.theta = []
     self._ops = nn.ModuleList()
     self._blocks = blocks
-
+    
+    self.softmax_type = sf_type
+    self.lat_constr = torch.Tensor([lat_const]).cuda()
+    self.loss_type = loss_type
+    
     tmp = []
     input_conv_count = 0
     for b in blocks:
@@ -123,12 +128,14 @@ class FBNet(nn.Module):
     # nn.Sequential(nn.BatchNorm2d(dim_feature)
     # nn.Linear(dim_feature, num_classes))
 
-  def forward(self, input, target, temperature=5.0, theta_list=None):
+  # softmax_type: 0 = gumbel, 1 = softmax
+  def forward(self, input, target, temperature=5.0, theta_list=None): 
     batch_size = input.size()[0]
     self.batch_size = batch_size
     data = self._input_conv(input)
     theta_idx = 0
     lat = []
+    onehot_lat = []
     ener = []
     for l_idx in range(self._input_conv_count, len(self._blocks)):
       block = self._blocks[l_idx]
@@ -139,13 +146,23 @@ class FBNet(nn.Module):
         else:
           theta = theta_list[theta_idx]
         t = theta.repeat(batch_size, 1)
-        weight = nn.functional.gumbel_softmax(t,
+        if self.softmax_type == 0:
+          weight = nn.functional.gumbel_softmax(t,
                                 temperature)
+          #onehot_weight = nn.functional.gumbel_softmax(t,temperature,True)
+          onehot_weight = nn.functional.one_hot(torch.argmax(weight, dim =1), num_classes=len(weight[0]))
+        else:
+          weight = nn.functional.softmax(t, dim=1)
+          #onehot_weight = nn.functional.gumbel_softmax(t,hard=True)
+          onehot_weight = nn.functional.one_hot(torch.argmax(weight, dim =1), num_classes=len(weight[0]))
+          
         speed = self._speed[theta_idx][:blk_len].to(weight.device)
         energy = self._energy[theta_idx][:blk_len].to(weight.device)
         lat_ = weight * speed.repeat(batch_size, 1)
+        onehot_lat_ = onehot_weight * speed.repeat(batch_size, 1)
         ener_ = weight * energy.repeat(batch_size, 1)
         lat.append(torch.sum(lat_))
+        onehot_lat.append(torch.sum(onehot_lat_))
         ener.append(torch.sum(ener_))
         data = self._ops[theta_idx](data, weight)
         theta_idx += 1
@@ -154,18 +171,33 @@ class FBNet(nn.Module):
 
     data = self._output_conv(data)
     lat = sum(lat)
+    onehot_lat = sum(onehot_lat)
     ener = sum(ener)
+
     data = nn.functional.avg_pool2d(data, data.size()[2:])
     data = data.reshape((batch_size, -1))
     logits = self.classifier(data)
 
     self.ce = self._criterion(logits, target).sum()
     self.lat_loss = lat / batch_size
+    self.onehot_lat_loss = onehot_lat / batch_size
     self.ener_loss = ener / batch_size
-    self.loss = self.ce +  self._alpha * self.lat_loss.pow(self._beta) + self._gamma * self.ener_loss.pow(self._delta)
-
+        
+    if self.lat_constr == -1:
+      self.loss = self.ce +  self._alpha * self.lat_loss.pow(self._beta) + self._gamma * self.ener_loss.pow(self._delta)
+    else:
+      if self.loss_type == 1:
+        self.loss = self.ce  * ( self.lat_loss.pow(self._alpha) / self.lat_constr.pow(self._alpha) ) 
+      if self.loss_type == 2: # weighted sum
+        self.loss = self.ce * 0.6 + (self.lat_loss.pow(self._alpha) /  self.lat_constr.pow(self._alpha)) * 0.4
+      if self.loss_type == 3: # pareto-optimal
+        if self.lat_loss <= self.lat_constr:
+          self.loss = self.ce
+        else:
+          self.loss = self.ce * ( self.lat_loss.pow(self._alpha) / self.lat_constr.pow(self._alpha) ) 
+      
     pred = torch.argmax(logits, dim=1)
     # succ = torch.sum(pred == target).cpu().numpy() * 1.0
     self.acc = torch.sum(pred == target).float() / batch_size
-    return self.loss, self.ce, self.acc, self.lat_loss, self.ener_loss
+    return self.loss, self.ce, self.acc, self.lat_loss, self.ener_loss, self.onehot_lat_loss
 

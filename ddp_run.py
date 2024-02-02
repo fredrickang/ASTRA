@@ -8,6 +8,7 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.backends.cudnn as cudnn
 
 from supernet import FBNet
 from candblks import get_blocks
@@ -17,6 +18,7 @@ import os
 import logging
 import time
 import numpy as np
+import random
 
 
 from torch.utils.tensorboard import SummaryWriter
@@ -37,6 +39,9 @@ class Config(object):
     total_epoch = 90
     start_w_epoch = 1
     train_portion = 0.8
+    softmax_type = 0
+    lat_constr = -1
+    loss_type = 0
     lr_scheduler_params = {
     'T_max' : 400,
     'alpha' : 1e-4,
@@ -89,6 +94,8 @@ class Trainer:
         self.lat_avg = AverageMeter('lat')
         self.loss_avg = AverageMeter('loss')
         self.ener_avg = AverageMeter('ener')
+        self.onehot_lat_avg = AverageMeter('onehot_lat')
+        
         self.step_counter = 0
     
         self.w_optimizer = torch.optim.SGD(
@@ -110,19 +117,19 @@ class Trainer:
         
     def train_w(self, input, target):
         self.w_optimizer.zero_grad()
-        loss, ce, acc, lat, ener = self.model(input, target, self.temp)
+        loss, ce, acc, lat, ener, onehot_lat = self.model(input, target, self.temp)
         loss.backward()
         self.w_optimizer.step()
         
-        return loss.item(), ce.item(), acc.item(), lat.item(), ener.item()
+        return loss.item(), ce.item(), acc.item(), lat.item(), ener.item(), onehot_lat.item()
 
     def train_t(self, input, target):
         self.t_optimizer.zero_grad()
-        loss, ce, acc, lat, ener =  self.model(input, target, self.temp)
+        loss, ce, acc, lat, ener, onehot_lat =  self.model(input, target, self.temp)
         loss.backward()
         self.t_optimizer.step()
         
-        return loss.item(), ce.item(), acc.item(), lat.item(), ener.item()
+        return loss.item(), ce.item(), acc.item(), lat.item(), ener.item(), onehot_lat.item()
     
     def decay_temperature(self, decay_ratio=None):
         formal_temp = self.temp
@@ -133,22 +140,31 @@ class Trainer:
         if self.gpu_id == 0:
             print("Change temperature from %.5f to %.5f" % (formal_temp, self.temp))
         
+        self.tensorboard.add_scalar('Temperature', self.temp, self.step_counter)            
         
     def step(self, input, target, epoch, step, log_freq, func):
         input = input.cuda()
         target = target.cuda()
         
-        loss, ce, acc, lat, ener = func(input, target)
+        loss, ce, acc, lat, ener, onehot_lat = func(input, target)
         
         self.loss_avg.update(loss, input.size(0))
         self.ce_avg.update(ce, input.size(0))
         self.acc_avg.update(acc, input.size(0))
         self.lat_avg.update(lat, input.size(0))
         self.ener_avg.update(ener, input.size(0))
-
+        self.onehot_lat_avg.update(onehot_lat, input.size(0))
+        
         self.tensorboard.add_scalar('Accuracy',self.acc_avg.val, self.step_counter)
         self.tensorboard.add_scalar('Total Loss', self.loss_avg.val, self.step_counter)            
-        self.tensorboard.add_scalar('Latency',self.lat_avg.val,self.step_counter)
+        
+        self.tensorboard.add_scalars('Latency', {
+            'estimated': self.lat_avg.val,
+            'actual': self.onehot_lat_avg.val,
+            }, self.step_counter)
+        #self.tensorboard.add_scalar('Latency/estimated',self.lat_avg.val,self.step_counter)
+        #self.tensorboard.add_scalar('Latency/actual', self.onehot_lat_avg.val, self.step_counter)
+        
         self.tensorboard.add_scalar('Energy',self.ener_avg.val,self.step_counter)
 
         self.step_counter += 1
@@ -242,6 +258,9 @@ def load_train_objs(config:Config):
               beta=config.beta,
               gamma=0,
               delta=0,
+              sf_type=config.softmax_type,
+              lat_const=config.lat_constr,
+              loss_type= config.loss_type,
               speed_f="speed.txt",
 	      energy_f="energy.txt")
     return train_set, val_set, model
@@ -268,7 +287,10 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
 
 
 if __name__ == "__main__":
-    np.random.seed(0)
+    random.seed(2222)
+    torch.manual_seed(2222)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
 
     import argparse
     parser = argparse.ArgumentParser(description='simple distributed training job')
@@ -278,17 +300,30 @@ if __name__ == "__main__":
     parser.add_argument('--save', default="EXP", help="Experiment name")
     parser.add_argument('--gpus', default=1, type=int, help="Number of GPUs")
     parser.add_argument('--lr_mul', default=1, type=float, help="Learning rate multiplier")
+    parser.add_argument('--temp', default=5.0, type=float, help="Gumbel Softmax Temperature")
+    parser.add_argument('--temp_decay', default=0.956, type=float, help="Temperature decay ratio")
+    parser.add_argument('--softmax', default=0, type=int, help="Softmax type; 0: Gumbel, 1: Softmax")
+    parser.add_argument('--lat_constr', default=-1, type=float, help="Latency constraint; -1: No constraint, other: < constr")
+    parser.add_argument('--loss_type', default= 0, type=int, help='Loss function type; 0: latency-aware, 1:latency-constraint, 2:weighted, 3: Pareto-optimal')
+    parser.add_argument('--alpha', default=0.2, type=float, help="Latency penalty parameter")
     
     args = parser.parse_args()
     args.save = 'search-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
-    
+    if args.lat_constr == -1 and args.loss_type != 0:
+        print("latency constr and loss function not aligned")
+        exit(-1)    
+    print(args)
 
     config = Config()
     config.w_lr = config.w_lr*args.lr_mul
     config.t_lr = config.t_lr*args.lr_mul
-
+    
+    config.init_temperature = args.temp
+    config.temperature_decay = args.temp_decay
+    config.softmax_type = args.softmax
+    config.lat_constr = args.lat_constr
+    config.alpha = args.alpha
+    config.loss_type = args.loss_type
+    
     world_size = args.gpus
     mp.spawn(main, args=(world_size, args.save_every, args.total_epochs, args.batch_size, config, args.save), nprocs=world_size)
-    
-    
-    
