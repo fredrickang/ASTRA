@@ -22,7 +22,6 @@ class MixedOp(nn.Module):
     return sum(tmp)
 
 class FBNet(nn.Module):
-
   def __init__(self, num_classes, blocks,
                init_theta=1.0,
                speed_f='./speed.txt',
@@ -183,19 +182,21 @@ class FBNet(nn.Module):
     self.onehot_lat_loss = onehot_lat / batch_size
     self.ener_loss = ener / batch_size
         
-    if self.lat_constr == -1:
-      self.loss = self.ce +  self._alpha * self.lat_loss.pow(self._beta) + self._gamma * self.ener_loss.pow(self._delta)
-    else:
-      if self.loss_type == 1:
-        self.loss = self.ce  * ( self.lat_loss.pow(self._alpha) / self.lat_constr.pow(self._alpha) ) 
-      if self.loss_type == 2: # weighted sum
-        self.loss = self.ce * 0.6 + (self.lat_loss.pow(self._alpha) /  self.lat_constr.pow(self._alpha)) * 0.4
-      if self.loss_type == 3: # pareto-optimal
-        if self.lat_loss <= self.lat_constr:
-          self.loss = self.ce
-        else:
-          self.loss = self.ce * ( self.lat_loss.pow(self._alpha) / self.lat_constr.pow(self._alpha) ) 
-      
+    # if self.lat_constr == -1:
+    #   self.loss = self.ce +  self._alpha * self.lat_loss.pow(self._beta) + self._gamma * self.ener_loss.pow(self._delta)
+    # else:
+    #   if self.loss_type == 1:
+    #     self.loss = self.ce  * ( self.lat_loss.pow(self._alpha) / self.lat_constr.pow(self._alpha) ) 
+    #   if self.loss_type == 2: # weighted sum
+    #     self.loss = self.ce * 0.6 + (self.lat_loss.pow(self._alpha) /  self.lat_constr.pow(self._alpha)) * 0.4
+    #   if self.loss_type == 3: # pareto-optimal
+    #     if self.lat_loss <= self.lat_constr:
+    #       self.loss = self.ce
+    #     else:
+    #       self.loss = self.ce * ( self.lat_loss.pow(self._alpha) / self.lat_constr.pow(self._alpha) ) 
+    
+    self.loss = self.ce
+    
     pred = torch.argmax(logits, dim=1)
     # succ = torch.sum(pred == target).cpu().numpy() * 1.0
     self.acc = torch.sum(pred == target).float() / batch_size
