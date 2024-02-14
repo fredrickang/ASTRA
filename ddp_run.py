@@ -256,37 +256,8 @@ class Trainer:
         target = target.cuda()
         
         loss, ce, acc, lat, ener, onehot_lat = func(input, target)
-        
-        # self.loss_avg.update(loss, input.size(0))
-        # self.ce_avg.update(ce, input.size(0))
-        # self.acc_avg.update(acc, input.size(0))
-        # self.lat_avg.update(lat, input.size(0))
-        # self.ener_avg.update(ener, input.size(0))
-        # self.onehot_lat_avg.update(onehot_lat, input.size(0))
-                
+         
         self.tensorboard.add_scalar('{}/Val_Accuracy'.format(self.trainer_name), acc/input.size(0) , self.step_counter)
-        # self.tensorboard.add_scalar('{}/Val_Total Loss'.format(self.trainer_name), self.loss_avg.val, self.step_counter)               
-        
-        # self.tensorboard.add_scalars('{}/Val_Latency'.format(self.trainer_name), {
-        #     'estimated': self.lat_avg.val,
-        #     'actual': self.onehot_lat_avg.val,
-        #     }, self.step_counter)
-        #self.tensorboard.add_scalar('Latency/estimated',self.lat_avg.val,self.step_counter)
-        #self.tensorboard.add_scalar('Latency/actual', self.onehot_lat_avg.val, self.step_counter)
-        
-        # self.step_counter += 1
-        
-        # if step > 1 and (step % log_freq == 0) and self.gpu_id == 0:
-        #     self.toc = time.time()
-            
-        #     batch_size = self.model.module.batch_size
-        #     speed = 1.0 * (batch_size * torch.cuda.device_count() * log_freq) / (self.toc - self.tic)
-        #     print("Epoch[%.3d] Batch[%.3d] Speed: %.6f samples/sec LR %.5f %s %s %s %s %s" 
-        #       % (epoch, step, speed, self.w_scheduler.optimizer.param_groups[0]['lr'], self.loss_avg, 
-        #          self.acc_avg, self.ce_avg, self.lat_avg,self.ener_avg))
-            
-        #     self.tic = time.time()
-
 
 
             
@@ -373,7 +344,7 @@ class Trainer:
                 t_list = list(t.detach().cpu().numpy())
                 if(len(t_list) < 9): t_list.append(0.00)
                 max_index = t_list.index(max(t_list))
-                self.tensorboard.add_scalar('%s/Layer %s'% (self.trainer_name, str(i)),max_index+1, epoch)
+                self.tensorboard.add_scalar('%s_theta/%s'% (self.trainer_name, str(i)),max_index+1, self.step_counter)
                 res.append(t_list)
                 s = ' '.join([str(tmp) for tmp in t_list])
                 f.write(s + '\n')
@@ -383,12 +354,13 @@ class Trainer:
 class Multi_Trainer:
     def __init__(
         self,
+        rank: int,
         trainer1: Trainer,
         trainer2: Trainer,
         trainer3: Trainer,
         total_constr: float,
     ) -> None:
-        
+        self.gpu_id = rank
         self.trainer1 = trainer1
         self.trainer2 = trainer2
         self.trainer3 = trainer3
@@ -421,6 +393,11 @@ class Multi_Trainer:
                 self.trainer3.w_scheduler.step()
                 
         for epoch in range(total_epochs):
+            
+            self.trainer1.model.train()
+            self.trainer2.model.train()
+            self.trainer3.model.train()
+            
             for st, (input, target) in enumerate(train_ds):
                 self.trainer1.tic = time.time()
                 self.trainer1.step_multi(input, target, epoch+warmup, st, log_freq, 
@@ -448,6 +425,15 @@ class Multi_Trainer:
             self.trainer1.decay_temperature()                
             self.trainer2.decay_temperature()
             self.trainer3.decay_temperature()
+            
+            if self.gpu_id == 0:
+                self.trainer1.save_theta(save_path='./theta_result/{}_{}'.format(self.trainer1.logging_prefix, self.trainer1.trainer_name), 
+                            file_name='theta_epoch_{}.txt'.format(epoch + warmup), epoch=epoch)
+                self.trainer2.save_theta(save_path='./theta_result/{}_{}'.format(self.trainer2.logging_prefix, self.trainer2.trainer_name), 
+                            file_name='theta_epoch_{}.txt'.format(epoch + warmup), epoch=epoch)
+                self.trainer3.save_theta(save_path='./theta_result/{}_{}'.format(self.trainer3.logging_prefix, self.trainer3.trainer_name), 
+                            file_name='theta_epoch_{}.txt'.format(epoch + warmup), epoch=epoch)
+            
 
             for st, (input, target) in enumerate(train_ds):
                 self.trainer1.tic = time.time()
@@ -476,10 +462,14 @@ class Multi_Trainer:
             
             # ## validation code
 
-            # for st, (input, target) in enumerate(val_ds):
+            # self.trainer1.model.eval()
+            # self.trainer2.model.eval()
+            # self.trainer3.model.eval()
+            
+            # for st, (input, target) in enumerate(val_ds):    
             #     self.trainer1.val_step(input, target, epoch, st, log_freq, 
             #                         lambda x, y: self.trainer1.validate(x,y))
-            
+
             #     self.trainer2.val_step(input, target, epoch, st, log_freq, 
             #                         lambda x, y: self.trainer2.validate(x,y))
             
@@ -501,7 +491,7 @@ def load_train_objs(config:Config):
     dataset = torchvision.datasets.CIFAR10(root='./data', train=True, 
                 download=True, transform=train_transform)
 
-    split = int(np.floor(0.7*len(dataset)))
+    split = int(np.floor(1*len(dataset)))
     train_set, val_set = torch.utils.data.random_split(dataset, [split, len(dataset) - split])
 
     blocks = get_blocks(cifar10=True)
@@ -536,7 +526,7 @@ def load_multi_train_objs(config:Config):
     dataset = torchvision.datasets.CIFAR10(root='./data', train=True, 
                 download=True, transform=train_transform)
 
-    split = int(np.floor(1*len(dataset)))
+    split = int(np.floor(0.7*len(dataset)))
     train_set, val_set = torch.utils.data.random_split(dataset, [split, len(dataset) - split])
 
     blocks = get_blocks(cifar10=True)
@@ -601,7 +591,7 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
     trainer2 = Trainer("trainer2", model2, train_data, val_data, rank, save_every, config.lr_scheduler_params, writer, exp_name, config, config.rt_loss, config.p2)
     trainer3 = Trainer("trainer3", model3, train_data, val_data, rank, save_every, config.lr_scheduler_params, writer, exp_name, config, config.rt_loss, config.p3)
     
-    multi_trainer = Multi_Trainer(trainer1, trainer2, trainer3, config.total_lat_constr)
+    multi_trainer = Multi_Trainer(rank, trainer1, trainer2, trainer3, config.total_lat_constr)
     multi_trainer.search(train_data, val_data,
                    total_epochs, save_every, 2)
     destroy_process_group()

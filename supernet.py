@@ -149,11 +149,11 @@ class FBNet(nn.Module):
           weight = nn.functional.gumbel_softmax(t,
                                 temperature)
           #onehot_weight = nn.functional.gumbel_softmax(t,temperature,True)
-          onehot_weight = nn.functional.one_hot(torch.argmax(weight, dim =1), num_classes=len(weight[0]))
+          onehot_weight = nn.functional.one_hot(torch.argmax(t, dim =1), num_classes=len(t[0]))
         else:
           weight = nn.functional.softmax(t, dim=1)
           #onehot_weight = nn.functional.gumbel_softmax(t,hard=True)
-          onehot_weight = nn.functional.one_hot(torch.argmax(weight, dim =1), num_classes=len(weight[0]))
+          onehot_weight = nn.functional.one_hot(torch.argmax(t, dim =1), num_classes=len(t[0]))
           
         speed = self._speed[theta_idx][:blk_len].to(weight.device)
         energy = self._energy[theta_idx][:blk_len].to(weight.device)
