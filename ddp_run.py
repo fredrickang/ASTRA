@@ -93,7 +93,6 @@ class Trainer:
         self.ce_avg = AverageMeter('ce')
         self.lat_avg = AverageMeter('lat')
         self.loss_avg = AverageMeter('loss')
-        self.ener_avg = AverageMeter('ener')
         self.onehot_lat_avg = AverageMeter('onehot_lat')
         
         self.step_counter = 0
@@ -117,19 +116,19 @@ class Trainer:
         
     def train_w(self, input, target):
         self.w_optimizer.zero_grad()
-        loss, ce, acc, lat, ener, onehot_lat = self.model(input, target, self.temp)
+        loss, ce, acc, lat, onehot_lat = self.model(input, target, self.temp)
         loss.backward()
         self.w_optimizer.step()
         
-        return loss.item(), ce.item(), acc.item(), lat.item(), ener.item(), onehot_lat.item()
+        return loss.item(), ce.item(), acc.item(), lat.item(), onehot_lat.item()
 
     def train_t(self, input, target):
         self.t_optimizer.zero_grad()
-        loss, ce, acc, lat, ener, onehot_lat =  self.model(input, target, self.temp)
+        loss, ce, acc, lat, onehot_lat =  self.model(input, target, self.temp)
         loss.backward()
         self.t_optimizer.step()
         
-        return loss.item(), ce.item(), acc.item(), lat.item(), ener.item(), onehot_lat.item()
+        return loss.item(), ce.item(), acc.item(), lat.item(), onehot_lat.item()
     
     def decay_temperature(self, decay_ratio=None):
         formal_temp = self.temp
@@ -146,13 +145,12 @@ class Trainer:
         input = input.cuda()
         target = target.cuda()
         
-        loss, ce, acc, lat, ener, onehot_lat = func(input, target)
+        loss, ce, acc, lat, onehot_lat = func(input, target)
         
         self.loss_avg.update(loss, input.size(0))
         self.ce_avg.update(ce, input.size(0))
         self.acc_avg.update(acc, input.size(0))
         self.lat_avg.update(lat, input.size(0))
-        self.ener_avg.update(ener, input.size(0))
         self.onehot_lat_avg.update(onehot_lat, input.size(0))
         
         self.tensorboard.add_scalar('Accuracy',self.acc_avg.val, self.step_counter)
@@ -162,10 +160,6 @@ class Trainer:
             'estimated': self.lat_avg.val,
             'actual': self.onehot_lat_avg.val,
             }, self.step_counter)
-        #self.tensorboard.add_scalar('Latency/estimated',self.lat_avg.val,self.step_counter)
-        #self.tensorboard.add_scalar('Latency/actual', self.onehot_lat_avg.val, self.step_counter)
-        
-        self.tensorboard.add_scalar('Energy',self.ener_avg.val,self.step_counter)
 
         self.step_counter += 1
         
@@ -174,9 +168,9 @@ class Trainer:
             
             batch_size = self.model.module.batch_size
             speed = 1.0 * (batch_size * torch.cuda.device_count() * log_freq) / (self.toc - self.tic)
-            print("Epoch[%.3d] Batch[%.3d] Speed: %.6f samples/sec LR %.5f %s %s %s %s %s" 
+            print("Epoch[%.3d] Batch[%.3d] Speed: %.6f samples/sec LR %.5f %s %s %s %s" 
               % (epoch, step, speed, self.w_scheduler.optimizer.param_groups[0]['lr'], self.loss_avg, 
-                 self.acc_avg, self.ce_avg, self.lat_avg,self.ener_avg))
+                 self.acc_avg, self.ce_avg, self.lat_avg))
             
             self.tic = time.time()
         
@@ -261,8 +255,7 @@ def load_train_objs(config:Config):
               sf_type=config.softmax_type,
               lat_const=config.lat_constr,
               loss_type= config.loss_type,
-              speed_f="speed.txt",
-	      energy_f="energy.txt")
+              speed_f="speed.txt")
     return train_set, val_set, model
 
 def prepare_dataloader(dataset: Dataset, batch_size: int):
