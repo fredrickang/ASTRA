@@ -42,6 +42,7 @@ class Config(object):
     softmax_type = 0
     lat_constr = -1
     loss_type = 0
+    seperate = 0
     lr_scheduler_params = {
     'T_max' : 400,
     'alpha' : 1e-4,
@@ -50,7 +51,6 @@ class Config(object):
     'lr_mul' : 0.98,
     }
     
-
 def ddp_setup(rank, world_size):
     """
     Args:
@@ -61,7 +61,7 @@ def ddp_setup(rank, world_size):
     os.environ["MASTER_PORT"] = "1234"
     init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
-    
+
 class Trainer:
     def __init__(
         self,
@@ -255,6 +255,7 @@ def load_train_objs(config:Config):
               sf_type=config.softmax_type,
               lat_const=config.lat_constr,
               loss_type= config.loss_type,
+              seperate=config.seperate,
               speed_f="speed.txt")
     return train_set, val_set, model
 
@@ -277,7 +278,7 @@ def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_s
     trainer.search(train_data, val_data,
                    total_epochs, save_every, 2)
     destroy_process_group()
-
+    
 
 if __name__ == "__main__":
     random.seed(2222)
@@ -299,6 +300,7 @@ if __name__ == "__main__":
     parser.add_argument('--lat_constr', default=-1, type=float, help="Latency constraint; -1: No constraint, other: < constr")
     parser.add_argument('--loss_type', default= 0, type=int, help='Loss function type; 0: latency-aware, 1:latency-constraint, 2:weighted, 3: Pareto-optimal')
     parser.add_argument('--alpha', default=0.2, type=float, help="Latency penalty parameter")
+    parser.add_argument('--seperate', default = 0, type= int, help="arch/lat weight seperation")
     
     args = parser.parse_args()
     args.save = 'search-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
@@ -317,6 +319,7 @@ if __name__ == "__main__":
     config.lat_constr = args.lat_constr
     config.alpha = args.alpha
     config.loss_type = args.loss_type
+    config.seperate = args.seperate
     
     world_size = args.gpus
     mp.spawn(main, args=(world_size, args.save_every, args.total_epochs, args.batch_size, config, args.save), nprocs=world_size)
