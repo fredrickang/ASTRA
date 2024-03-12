@@ -147,7 +147,7 @@ class Trainer:
         if self.rt_loss == 0:
             integrated_lat_loss = lat + sum(lat_losses)
             if integrated_lat_loss <= multi_lat_constr:
-                    integrated_loss = ce
+                integrated_loss = ce
             else:
                 integrated_loss = ce * (integrated_lat_loss.pow(self.model.module._alpha) / pow(multi_lat_constr, self.model.module._alpha))
         else:
