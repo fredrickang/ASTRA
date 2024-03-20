@@ -23,26 +23,26 @@ import random
 
 from torch.utils.tensorboard import SummaryWriter
 
+torch.backends.cudnn.deterministic = True
+
 class Config(object):
     num_cls_used = 10
     init_theta = 1.0
-    alpha = 0.2
-    beta = 0.6
     w_lr = 0.1 
     w_mom = 0.9
     w_wd = 1e-4
     t_lr = 0.01 
     t_wd = 5e-4
     t_beta = (0.9, 0.999)
-    init_temperature = 5.0
-    temperature_decay = 0.956
     total_epoch = 90
     start_w_epoch = 1
     train_portion = 0.8
-    softmax_type = 0
     lat_constr = -1
-    loss_type = 0
-    seperate = 0
+    amplifier = 1.0
+    amplifying = 1.0
+    separation = 0.0
+    sep_temp = 1.0
+    alpha = 1.0
     lr_scheduler_params = {
     'T_max' : 400,
     'alpha' : 1e-4,
@@ -59,7 +59,13 @@ def ddp_setup(rank, world_size):
     """
     os.environ["MASTER_ADDR"] = "0.0.0.0"
     os.environ["MASTER_PORT"] = "1234"
-    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    tmp_rank = rank
+    if rank >= world_size:
+        tmp_rank = rank - world_size
+        os.environ["MASTER_PORT"] = "1235"
+    
+
+    init_process_group(backend="nccl", rank=tmp_rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 class Trainer:
@@ -85,9 +91,10 @@ class Trainer:
         
         self.params = self.model.module.parameters()
         self.theta = self.model.module.theta    
-        self._temp_decay = config.temperature_decay
-        self.temp = config.init_temperature
-        
+        self.config = config
+        self.amplifier = config.amplifier
+        self.separation = config.separation
+    
         self.tensorboard = writer
         self.acc_avg = AverageMeter('acc')
         self.ce_avg = AverageMeter('ce')
@@ -116,7 +123,7 @@ class Trainer:
         
     def train_w(self, input, target):
         self.w_optimizer.zero_grad()
-        loss, ce, acc, lat, onehot_lat = self.model(input, target, self.temp)
+        loss, ce, acc, lat, onehot_lat = self.model(input, target, self.amplifier, self.separation)
         loss.backward()
         self.w_optimizer.step()
         
@@ -124,23 +131,50 @@ class Trainer:
 
     def train_t(self, input, target):
         self.t_optimizer.zero_grad()
-        loss, ce, acc, lat, onehot_lat =  self.model(input, target, self.temp)
+        loss, ce, acc, lat, onehot_lat =  self.model(input, target, self.amplifier, self.separation)
         loss.backward()
         self.t_optimizer.step()
         
         return loss.item(), ce.item(), acc.item(), lat.item(), onehot_lat.item()
     
-    def decay_temperature(self, decay_ratio=None):
-        formal_temp = self.temp
-        if decay_ratio is None:
-            self.temp *= self._temp_decay
-        else:
-            self.temp *= decay_ratio
+    def amplify_amplifier(self, ):
+        formal_amplifier = self.amplifier
+        if self.amplifier <= 100:
+            self.amplifier *= self.config.amplifying
+        
         if self.gpu_id == 0:
-            print("Change temperature from %.5f to %.5f" % (formal_temp, self.temp))
+            print("Change amplifier from %.5f to %.5f" % (formal_amplifier, self.amplifier))
+    
+    def tempering_separation(self, ):
+        formal_separation = self.separation
+        if self.separation <= 1.0:
+            self.separation *= self.config.sep_temp
         
-        self.tensorboard.add_scalar('Temperature', self.temp, self.step_counter)            
+        if self.gpu_id == 0:
+            print("Change Separation from %.5f to %.5f" % (formal_separation, self.separation))       
+    
+    # def decay_temperature(self, decay_ratio=None):
+    #     formal_temp = self.temp
+    #     if decay_ratio is None:
+    #         if self.temp <= 100:
+    #             self.temp *= self._temp_decay
+    #     else:
+    #         self.temp *= decay_ratio
+    #     if self.gpu_id == 0:
+    #         print("Change temperature from %.5f to %.5f" % (formal_temp, self.temp))
         
+    #     self.tensorboard.add_scalar('Temperature', self.temp, self.step_counter)            
+    
+    # def temper_separation(self, temper_ratio=None):
+    #     formal_separation = self.model.module._beta
+    #     if temper_ratio is None:
+    #         if self.model.module._beta <= 3.0:
+    #             self.model.module._beta *= 1.046
+    #     if self.gpu_id == 0:
+    #         print("Change separation intensity from %.5f to %.5f" % (formal_separation, self.model.module._beta))
+        
+    #     self.tensorboard.add_scalar('Separation', self.model.module._beta, self.step_counter)
+    
     def step(self, input, target, epoch, step, log_freq, func):
         input = input.cuda()
         target = target.cuda()
@@ -163,7 +197,7 @@ class Trainer:
 
         self.step_counter += 1
         
-        if step > 1 and (step % log_freq == 0) and self.gpu_id == 0:
+        if step > 1 and (step % log_freq == 0) and (self.gpu_id == 0 or self.gpu_id == 4):
             self.toc = time.time()
             
             batch_size = self.model.module.batch_size
@@ -197,7 +231,9 @@ class Trainer:
             if self.gpu_id == 0:
                 self.save_theta(save_path='./theta_result/{}'.format(self.logging_prefix), 
                             file_name='theta_epoch_{}.txt'.format(epoch + warmup), epoch=epoch)
-            self.decay_temperature()
+            
+            self.amplify_amplifier()
+            self.tempering_separation()
             
             for st, (input, target) in enumerate(train_ds):
                 self.step(input, target, epoch + warmup, st, log_freq,
@@ -249,13 +285,7 @@ def load_train_objs(config:Config):
               blocks=blocks,
               init_theta=config.init_theta,
               alpha=config.alpha,
-              beta=config.beta,
-              gamma=0,
-              delta=0,
-              sf_type=config.softmax_type,
               lat_const=config.lat_constr,
-              loss_type= config.loss_type,
-              seperate=config.seperate,
               speed_f="speed.txt")
     return train_set, val_set, model
 
@@ -268,13 +298,13 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
         sampler=DistributedSampler(dataset)
     )
 
-def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int, config: Config, exp_name: str):
-    ddp_setup(rank, world_size)
+def main(rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int, config: Config, exp_name: str, offset: int):
+    ddp_setup(rank+offset, world_size)
     train_set, val_set, model = load_train_objs(config)
     train_data = prepare_dataloader(train_set, batch_size)
     val_data = prepare_dataloader(val_set, batch_size)
     writer = SummaryWriter("./runs/{}".format(exp_name))
-    trainer = Trainer(model, train_data, val_data, rank, save_every, config.lr_scheduler_params, writer, exp_name, config)
+    trainer = Trainer(model, train_data, val_data, rank+offset, save_every, config.lr_scheduler_params, writer, exp_name, config)
     trainer.search(train_data, val_data,
                    total_epochs, save_every, 2)
     destroy_process_group()
@@ -293,33 +323,29 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=1024, type=int, help='Input batch size on each device (default: 1024)')
     parser.add_argument('--save', default="EXP", help="Experiment name")
     parser.add_argument('--gpus', default=1, type=int, help="Number of GPUs")
-    parser.add_argument('--lr_mul', default=1, type=float, help="Learning rate multiplier")
-    parser.add_argument('--temp', default=5.0, type=float, help="Gumbel Softmax Temperature")
-    parser.add_argument('--temp_decay', default=0.956, type=float, help="Temperature decay ratio")
-    parser.add_argument('--softmax', default=0, type=int, help="Softmax type; 0: Gumbel, 1: Softmax")
+    parser.add_argument('--amplifier', default=1, type=float, help="Softmax Amplifier")
+    parser.add_argument('--amplifying', default=1, type=float, help="Softmax Amplifier amplfying param")
+    parser.add_argument('--separation', default=0, type=float, help="Separation loss intensity")
+    parser.add_argument('--sep_temp', default=1, type=float, help="Separation amplfying param")
     parser.add_argument('--lat_constr', default=-1, type=float, help="Latency constraint; -1: No constraint, other: < constr")
-    parser.add_argument('--loss_type', default= 0, type=int, help='Loss function type; 0: latency-aware, 1:latency-constraint, 2:weighted, 3: Pareto-optimal')
-    parser.add_argument('--alpha', default=0.2, type=float, help="Latency penalty parameter")
-    parser.add_argument('--seperate', default = 0, type= int, help="arch/lat weight seperation")
-    
+    parser.add_argument('--lat_penalty', default=1, type=float, help="latency penalty")
+    parser.add_argument('--gpu_offset', default=0, type=int, help="ddp gpu offset")
     args = parser.parse_args()
-    args.save = 'search-{}-{}'.format(args.save, time.strftime("%Y%m%d-%H%M%S"))
-    if args.lat_constr == -1 and args.loss_type != 0:
-        print("latency constr and loss function not aligned")
-        exit(-1)    
+    
     print(args)
 
-    config = Config()
-    config.w_lr = config.w_lr*args.lr_mul
-    config.t_lr = config.t_lr*args.lr_mul
-    
-    config.init_temperature = args.temp
-    config.temperature_decay = args.temp_decay
-    config.softmax_type = args.softmax
+    config = Config()    
     config.lat_constr = args.lat_constr
-    config.alpha = args.alpha
-    config.loss_type = args.loss_type
-    config.seperate = args.seperate
+    config.amplifier = args.amplifier
+    config.amplifying = args.amplifying
+    config.separation = args.separation
+    config.sep_temp = args.sep_temp
+    config.alpha = args.lat_penalty
     
     world_size = args.gpus
-    mp.spawn(main, args=(world_size, args.save_every, args.total_epochs, args.batch_size, config, args.save), nprocs=world_size)
+    
+    args.save = 'search-{}-{}'.format("lat{}_amplifier{}_amplifying{}_separation{}_septemp{}".format(
+        config.lat_constr, config.amplifier, config.amplifying, config.separation, config.sep_temp), 
+                                      time.strftime("%Y%m%d-%H%M%S"))
+
+    mp.spawn(main, args=(world_size, args.save_every, args.total_epochs, args.batch_size, config, args.save, args.gpu_offset), nprocs=world_size)
